@@ -1,0 +1,58 @@
+name: Canary Snapshot
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+
+jobs:
+  canary:
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/canary')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: PRのHEADをチェックアウト
+        run: gh pr checkout ${{ github.event.issue.number }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://npm.pkg.github.com
+          scope: '@<github-username>'
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: スナップショットバージョンを付与
+        run: npx changeset version --snapshot canary
+
+      - id: ver
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: publish
+        run: npx changeset publish --tag canary --no-git-tag
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: PRにインストールコマンドを投稿
+        run: |
+          gh pr comment "${{ github.event.issue.number }}" --body "$(cat <<'EOF'
+          スナップショットを発行しました。
+
+          \`\`\`bash
+          npm i @<github-username>/ks-button-lab@${{ steps.ver.outputs.version }}
+          \`\`\`
+          EOF
+          )"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
