@@ -28,7 +28,7 @@ jobs:
           node-version: 24
           cache: npm
           registry-url: https://npm.pkg.github.com
-          scope: '@<github-username>'
+          scope: '@kentem-ka-hashimoto'
 
       - run: npm ci
       - run: npm run build
@@ -36,23 +36,33 @@ jobs:
       - name: スナップショットバージョンを付与
         run: npx changeset version --snapshot canary
 
-      - id: ver
-        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: パッケージ情報を取得
+        id: pkg
+        run: |
+          echo "name=$(node -p "require('./package.json').name")" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
       - name: publish
         run: npx changeset publish --tag canary --no-git-tag
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: PRにインストールコマンドを投稿
+      - name: コメント本文を生成
+        env:
+          PKG_NAME: ${{ steps.pkg.outputs.name }}
+          PKG_VERSION: ${{ steps.pkg.outputs.version }}
         run: |
-          gh pr comment "${{ github.event.issue.number }}" --body "$(cat <<'EOF'
-          スナップショットを発行しました。
+          {
+            echo "スナップショットを発行しました。"
+            echo ""
+            echo '```bash'
+            echo "npm i ${PKG_NAME}@${PKG_VERSION}"
+            echo '```'
+            echo ""
+            echo "このバージョンは \`canary\` タグで公開されています。\`latest\` は変更されていません。"
+          } > comment.md
 
-          \`\`\`bash
-          npm i @<github-username>/ks-button-lab@${{ steps.ver.outputs.version }}
-          \`\`\`
-          EOF
-          )"
+      - name: PRにインストールコマンドを投稿
+        run: gh pr comment "${{ github.event.issue.number }}" --body-file comment.md
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
