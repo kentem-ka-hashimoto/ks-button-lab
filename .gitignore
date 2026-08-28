@@ -1,0 +1,20 @@
+# 依存関係
+node_modules/
+
+# ビルド成果物
+dist/
+
+# 環境変数
+.env
+.env.*
+!.env.example
+
+# ログ
+*.log
+npm-debug.log*
+
+# エディタ / OS
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
