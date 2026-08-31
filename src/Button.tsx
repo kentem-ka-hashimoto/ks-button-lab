@@ -12,7 +12,7 @@ export function Button({ variant = "primary", ...rest }: ButtonProps) {
       style={{
         padding: "8px 16px",
         borderRadius: 4,
-        border: "none",
+        border: "1px solid transparent",
         cursor: "pointer",
         color: variant === "primary" ? "#fff" : "#333",
         background: variant === "primary" ? "#0b6bcb" : "#e5e7eb",
