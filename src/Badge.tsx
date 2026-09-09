@@ -1,11 +1,13 @@
 import type { CSSProperties } from 'react';
 
 export type BadgeVariant = 'default' | 'success' | 'warning';
+export type BadgeSize = 'sm' | 'md';
 
 export type BadgeProps = {
   label: string;
   variant?: BadgeVariant;
   maxLength?: number;
+  size?: BadgeSize;
 };
 
 const variantStyle: Record<BadgeVariant, CSSProperties> = {
@@ -14,15 +16,19 @@ const variantStyle: Record<BadgeVariant, CSSProperties> = {
   warning: { background: '#fdf0e3', color: '#8a4b00' },
 };
 
-export function Badge({ label, variant = 'default', maxLength = 12 }: BadgeProps) {
+const sizeStyle: Record<BadgeSize, CSSProperties> = {
+  sm: { padding: '1px 6px', fontSize: 11 },
+  md: { padding: '2px 8px', fontSize: 12 },
+};
+
+export function Badge({ label, variant = 'default', maxLength = 12, size = 'md' }: BadgeProps) {
   return (
     <span
       style={{
         ...variantStyle[variant],
         display: 'inline-block',
         borderRadius: 4,
-        padding: '2px 8px',
-        fontSize: 12,
+        ...sizeStyle[size],
       }}
     >
       {truncate(label, maxLength)}
