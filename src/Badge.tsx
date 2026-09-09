@@ -35,5 +35,5 @@ function truncate(label: string, maxLength: number): string {
   if (label.length <= maxLength) {
     return label;
   }
-  return `${label.slice(0, maxLength)}…`;
+  return `${label.slice(0, maxLength - 1)}…`;
 }
