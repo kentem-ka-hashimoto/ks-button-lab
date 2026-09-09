@@ -1,5 +1,15 @@
 # @kentem-ka-hashimoto/ks-button-lab
 
+## 1.1.0
+
+### Minor Changes
+
+- 369608d: Badge コンポーネントを追加
+
+### Patch Changes
+
+- e5ba018: maxLength を超えたラベルの省略後の文字数が maxLength + 1 になっていた問題を修正
+
 ## 1.0.0
 
 ### Major Changes
