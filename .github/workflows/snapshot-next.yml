@@ -1,28 +1,205 @@
-name: CI
+# =============================================================================
+# .github/workflows/snapshot-next.yml
+# -----------------------------------------------------------------------------
+# 【役割】mainの「今の統合状態」を使い捨てバージョンとして発行し、
+#         next タグを付け替えます。
+#
+#   各プロダクトは以下のコマンドで、いつでも
+#   「今マージされている全変更が入った状態」を取得できます。
+#
+#       npm i @<scope>/ks-react-components@next
+#
+#   発行されるバージョン: 1.3.0-next-20260901120000
+#     1.3.0    … 次の正式リリースで付く予定のバージョン
+#     next     … dist-tag と同じ識別子
+#     20260901…… 発行日時
+#
+#   config.json の useCalculatedVersion: true により、先頭が 0.0.0 ではなく
+#   計算値になります。バージョン文字列を見るだけで次のリリース番号が
+#   読み取れるのがこのワークフローの価値です。
+#
+# 【このファイルは「使い捨て」側です】
+#   正式なバージョン番号を消費しません。latest タグにも影響しません。
+#
+# 【dist-tag の3層構造】
+#   canary … 個別PRのHEAD（自分の変更の動作確認）      → snapshot-canary.yml
+#   next   … 今のmain（他PRとの統合確認、リリース前検証）→ このファイル
+#   latest … 正式リリース（本番参照）                    → release-latest.yml
+#
+#   プロダクト側の想定フロー:
+#     開発中         → @canary で自分の変更を確認
+#     リリース準備期 → @next で統合状態を確認
+#     リリース確定   → @latest の固定バージョンに切り替え
+# =============================================================================
+
+name: Snapshot (next)
 
 on:
-  pull_request:
+  push:
+    # main への push（= PRのマージ）ごとに実行されます。
+    # release-latest.yml と同じトリガーですが、別ワークフローに分離しています。
+    # 理由: changesets/action は内部で別ブランチを作ってバージョンを操作するため、
+    #       同じジョブ内で snapshot を続けて実行すると作業ツリーの状態が
+    #       予測しづらくなります。独立させたほうが挙動が読めます。
     branches: [main]
+
+# このワークフロー同士の多重起動だけを防ぎます。
+# グループ名は github.workflow を使わず固定文字列にしています
+# （ワークフロー名を後から変えてもグループが変わらないようにするため）。
+#
+# cancel-in-progress は付けていません。publish 途中で中断されるのを避けるためです。
+# そのため短時間に2回マージすると next が2回発行されますが、
+# 後に発行されたものが next タグを取るため実害はありません。
+concurrency: snapshot-next-${{ github.ref }}
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
-  verify:
+  # ---------------------------------------------------------------------------
+  # ジョブ1: 未消費の changeset があるかを判定する
+  # ---------------------------------------------------------------------------
+  # 【なぜこの判定が必要か（★重要）】
+  #   main への push には2種類あります。
+  #     (a) 機能PRのマージ    … .changeset/*.md が残っている
+  #     (b) Version PRのマージ … .changeset/*.md が消費済みで、
+  #                              package.json は既に 1.3.0 に上がっている
+  #
+  #   (b) の状態で `changeset version --snapshot` を実行しても、消費すべき
+  #   changeset が無いためバージョンは書き換わりません。その結果、続く
+  #   `changeset publish` が「本物の 1.3.0」を next タグで publish してしまいます。
+  #
+  #   こうなると release-latest.yml 側の publish が「1.3.0 は既に公開済み」と
+  #   判断してスキップし、latest タグが古いバージョンのまま取り残されます。
+  #   これを防ぐためのガードです。
+  detect-changesets:
+    name: Detect pending changesets
+    runs-on: ubuntu-latest
+    outputs:
+      has_changesets: ${{ steps.pending.outputs.has_changesets }}
+    steps:
+      - name: リポジトリをチェックアウト
+        # changeset ファイルの有無だけを見るので、浅いクローンで十分です。
+        uses: actions/checkout@v7
+
+      - name: 未消費の changeset を数える
+        id: pending
+        run: |
+          # .changeset 直下の *.md のうち、changeset ではないファイルを除外します。
+          #   README.md            … changeset init が置く説明ファイル
+          #   CLAUDE.md / AGENTS.md / GEMINI.md
+          #                        … AI向け指示ファイル。Changesets 側も
+          #                           これらを changeset として読まない扱いです
+          #   -maxdepth 1          … pre-releaseモードの .changeset/pre/ を除外
+          count=$(find .changeset -maxdepth 1 -name '*.md' \
+            ! -name 'README.md' \
+            ! -name 'CLAUDE.md' \
+            ! -name 'AGENTS.md' \
+            ! -name 'GEMINI.md' \
+            | wc -l | tr -d ' ')
+
+          echo "未消費の changeset: ${count} 件"
+
+          if [ "${count}" -gt 0 ]; then
+            echo "has_changesets=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changesets=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # ジョブ2: スナップショットを publish する
+  # ---------------------------------------------------------------------------
+  publish-next:
+    name: Publish next snapshot
+    needs: detect-changesets
+    # 未消費の changeset がある場合のみ実行します。
+    # Version PR のマージ直後（= 正式 publish が走るタイミング）は
+    # このジョブ全体がスキップされ、Actions の画面上でも skipped として
+    # 見えるため、意図した挙動だと判断できます。
+    if: needs.detect-changesets.outputs.has_changesets == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v7
         with:
-          fetch-depth: 0   # changeset status に必要
+          # changeset がバージョン計算で履歴を参照するため全履歴を取得します。
+          fetch-depth: 0
 
-      - uses: actions/setup-node@v6
+      - name: Node.js をセットアップ（認証付き .npmrc を生成）
+        uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
+          registry-url: https://npm.pkg.github.com
+          # ★本番では実際のスコープに置き換えます。
+          scope: '@<github-username>'
 
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run build
+      - name: 依存関係をインストール
+        run: npm ci
 
-      - name: changeset があるか確認
-        run: npx changeset status --since=origin/main
+      - name: ビルド
+        run: npm run build
+
+      - name: スナップショットバージョンを付与
+        # タグ名に `next` を渡しています。
+        # config.json の prereleaseTemplate が {tag}-{datetime} なので、
+        # 結果は 1.3.0-next-20260901120000 のような形式になります。
+        #
+        # この書き換えはランナー上の package.json に対してのみ行われ、
+        # コミットも push もされません。
+        run: npx changeset version --snapshot next
+
+      - name: パッケージ名とバージョンを取得
+        id: pkg
+        # 上の version の「後」に置くことで、書き換わった値を読めます。
+        run: |
+          echo "name=$(node -p "require('./package.json').name")" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: レジストリに publish
+        # --tag next     … dist-tag を next に固定します。省略すると latest を
+        #                   上書きし、全プロダクトが暫定版を取得してしまいます。
+        # --no-git-tag   … 使い捨てバージョンに git タグを作りません。
+        #                   contents: read しか無いためタグ push は失敗します。
+        run: npx changeset publish --tag next --no-git-tag
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 実行結果をサマリに記録
+        # $GITHUB_STEP_SUMMARY に書き込むと、ワークフロー実行ページの上部に
+        # Markdown として表示されます。「今の next は何番か」を
+        # 実行履歴から遡って確認できるようにするためです。
+        env:
+          PKG_NAME: ${{ steps.pkg.outputs.name }}
+          PKG_VERSION: ${{ steps.pkg.outputs.version }}
+        run: |
+          {
+            echo "## next スナップショットを更新しました"
+            echo ""
+            echo '```bash'
+            echo "npm i ${PKG_NAME}@next"
+            echo "# 固定したい場合: npm i ${PKG_NAME}@${PKG_VERSION}"
+            echo '```'
+            echo ""
+            echo "次の正式リリース予定バージョン: \`${PKG_VERSION%%-*}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# =============================================================================
+# 【運用上の注意】
+#
+# 1. レジストリにバージョンが溜まります
+#    main への push ごとに1バージョン増えます。マージが週に10回あれば
+#    月40バージョン程度です。GitHub Packages 側の保持期間ルール
+#    （例: next / canary は30日で削除）を決めておく必要があります。
+#
+# 2. next は「動作確認用」であり、本番参照用ではありません
+#    プロダクトの package.json に @next を書いたまま本番リリースすると、
+#    どのスナップショットで検証したかが追えなくなります。
+#    リリース確定時には latest の固定バージョンへ切り替える運用を
+#    ガイドに明記してください。
+#
+# 3. semver range には引っかかりません
+#    1.3.0-next-xxx はプレリリース版なので、^1.2.0 のような range には
+#    一致しません。@next を明示的に指定したプロダクトだけが取得します。
+# =============================================================================

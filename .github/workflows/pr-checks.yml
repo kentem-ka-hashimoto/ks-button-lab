@@ -1,0 +1,95 @@
+# =============================================================================
+# .github/workflows/pr-checks.yml
+# -----------------------------------------------------------------------------
+# 【役割】main 向けPRのガードレール。publish は一切しません。
+#
+#   確認する内容:
+#     1. 型が通るか
+#     2. ビルドが通るか
+#     3. changeset が添付されているか（バージョンが上がる状態になっているか）
+#
+# 【4つのワークフローの関係】
+#   pr-checks.yml       … PRの検証（このファイル）
+#   snapshot-canary.yml … PR単位の使い捨て版を canary タグで発行
+#   snapshot-next.yml   … mainの現在状態を next タグで発行
+#   release-latest.yml  … Version PRの作成、および latest タグでの正式公開
+#
+#   前半2つは「使い捨て」、後半2つのうち release-latest.yml だけが
+#   「正式なバージョンを消費する」ワークフローです。
+#   ファイル名の snapshot- / release- がその区別を表しています。
+# =============================================================================
+
+name: PR Checks
+
+on:
+  pull_request:
+    # main を対象にしたPRが「作られたとき」「更新（push）されたとき」に実行されます。
+    # types を省略しているため、既定値の opened / synchronize / reopened が対象です。
+    branches: [main]
+
+permissions:
+  # 検証しかしないので読み取りのみ。
+  # publish に必要な packages: write は意図的に与えていません。
+  contents: read
+
+jobs:
+  checks:
+    # このジョブ名は、PR画面に表示されるステータスチェックの名前になります。
+    # ブランチ保護の「必須ステータスチェック」に登録する対象でもあるため、
+    # 一度決めたら変更しないようにしてください（変更すると設定が外れます）。
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v7
+        with:
+          # 既定は fetch-depth: 1 の浅いクローンで、履歴が1コミットしか取れません。
+          # 最後の changeset 確認ステップが origin/main との差分を計算するため、
+          # main側の履歴が必要になります。
+          fetch-depth: 0
+
+      - name: Node.js をセットアップ
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          # package-lock.json のハッシュをキーに ~/.npm をキャッシュし、
+          # npm ci を高速化します（node_modules 自体のキャッシュではありません）。
+          cache: npm
+          # registry-url / scope は指定していません。
+          # これらは認証情報付き .npmrc を生成するためのオプションなので、
+          # publish しないこのワークフローでは不要です。
+
+      - name: 依存関係をインストール
+        # npm install ではなく npm ci を使います。
+        # lock ファイルに完全一致でインストールし、lock を書き換えないため、
+        # CI の実行結果が再現可能になります。
+        run: npm ci
+
+      - name: 型チェック
+        # 一般的には tsc --noEmit（出力を作らず型エラーだけ検出）です。
+        run: npm run typecheck
+
+      - name: ビルド
+        # 「型は通るがビルド成果物が壊れている」ケース
+        # （package.json の exports と実際の出力拡張子の不整合など）を、
+        # publish ではなくPRの段階で捕まえるのが目的です。
+        run: npm run build
+
+      - name: changeset の添付を確認
+        # origin/main からの差分にパッケージの変更が含まれているのに
+        # .changeset/*.md が存在しない場合、終了コード1でジョブを失敗させます。
+        #
+        # これがバージョニング運用の要になるステップです。
+        # changeset の添付をレビューでの声かけではなくCIで強制することで、
+        # バージョンが上がらないまま変更が main に入る事故を防ぎます。
+        #
+        # 【ポイント】--since=main ではなく --since=origin/main を使う
+        #   CIのチェックアウトではローカルの main ブランチが作られないため、
+        #   --since=main だと ref の解決に失敗します。
+        #
+        # 【注意（推測・要確認）】
+        #   単一パッケージ構成では README のみの変更でもパッケージの変更と
+        #   見なされて失敗する可能性があります。その場合は
+        #   `npx changeset --empty` で空の changeset を作る運用にするか、
+        #   paths-ignore でドキュメント変更を除外してください。
+        run: npx changeset status --since=origin/main

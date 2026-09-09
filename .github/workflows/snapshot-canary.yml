@@ -1,6 +1,39 @@
-name: Canary Snapshot
+# =============================================================================
+# .github/workflows/snapshot-canary.yml
+# -----------------------------------------------------------------------------
+# 【役割】PRのコードを使い捨てバージョンとして発行し、canary タグを付けます。
+#
+#   PRのコメント欄に `/canary` と書くと発火し、インストールコマンドを
+#   PRにコメントで返します。マージ前に消費側プロダクトで
+#   実際に動作確認できるようにするのが目的です。
+#
+#   発行されるバージョン: 1.3.0-pr-123-20260901120000
+#     1.3.0    … 今の changeset を全部適用した場合の計算値（確定ではありません）
+#     pr-123   … どのPRのスナップショットかの識別子
+#     20260901…… 発行日時
+#
+# 【このファイルは「使い捨て」側です】
+#   正式なバージョン番号を消費しません。latest タグにも影響しません。
+#   正式公開は release-latest.yml が担当します。
+#
+# 【canary タグの注意】
+#   canary タグは常に「最後に /canary を実行した誰かのPR」を指します。
+#   プロダクト側は @canary ではなく、コメントで案内される
+#   完全なバージョン文字列を指定して固定するのが正しい使い方です。
+# =============================================================================
+
+name: Snapshot (canary)
 
 on:
+  # Issue または PR にコメントが投稿されたときに発火します。
+  # PR専用のトリガーは存在せず、GitHub内部ではPRもIssueの一種なので、
+  # PRかどうかの判定は下の if 条件で行います。
+  #
+  # 【重要な落とし穴】
+  #   issue_comment で起動されるワークフローは、
+  #   「コメントされたPRのブランチ」ではなく
+  #   「mainブランチにあるこのファイル」が実行されます。
+  #   このファイルを修正した場合、main にマージするまで反映されません。
   issue_comment:
     types: [created]
 
@@ -10,44 +43,143 @@ permissions:
   pull-requests: write
 
 jobs:
-  canary:
+  publish-canary:
+    name: Publish canary snapshot
+    # 2つの条件をANDで判定しています。
+    #   1. github.event.issue.pull_request が存在する
+    #        → IssueではなくPRへのコメントであることの判定。
+    #          PRの場合のみこのフィールドが生えるため、真偽値として使えます。
+    #   2. コメント本文が '/canary' で始まる
+    #        → 通常の議論コメントで発火させないためのフィルタ。
     if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/canary')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - name: リポジトリをチェックアウト（この時点では main の内容）
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: PRのHEADをチェックアウト
+      - name: PRのHEADに切り替え
+        # ここで初めて「試したいPRのコード」が手元に来ます。
+        # issue_comment トリガーの既定チェックアウト先は既定ブランチのため、
+        # 明示的に切り替える必要があります。
+        # gh コマンドは認証に GH_TOKEN 環境変数を参照します。
         run: gh pr checkout ${{ github.event.issue.number }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/setup-node@v6
+      - name: 未消費の changeset を確認
+        id: pending
+        # 【★重要なガード】
+        #   Version PR（changeset-release/main ブランチ）に対して /canary を
+        #   実行すると事故が起きます。そのブランチでは changeset が既に消費され、
+        #   package.json は本物の 1.3.0 に上がっているため、
+        #   `changeset version --snapshot` が何も書き換えません。
+        #   結果、続く publish が「本物の 1.3.0」を canary タグで公開してしまいます。
+        #
+        #   こうなると Version PR をマージしても
+        #   「1.3.0 は既に公開済み」と判断されて publish がスキップされ、
+        #   latest タグが古いバージョンのまま取り残されます。
+        #
+        #   changeset を添付していないPRでも同じ問題が起きるため、
+        #   ここで一律に弾いています。
+        run: |
+          # .changeset 直下の *.md のうち、changeset ではないファイルを除外します。
+          #   README.md / CLAUDE.md / AGENTS.md / GEMINI.md … 説明・AI向け指示ファイル
+          #   -maxdepth 1 … pre-releaseモードの .changeset/pre/ を除外
+          count=$(find .changeset -maxdepth 1 -name '*.md' \
+            ! -name 'README.md' \
+            ! -name 'CLAUDE.md' \
+            ! -name 'AGENTS.md' \
+            ! -name 'GEMINI.md' \
+            | wc -l | tr -d ' ')
+
+          echo "未消費の changeset: ${count} 件"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+
+      - name: changeset が無い場合は理由を伝えて終了
+        if: steps.pending.outputs.count == '0'
+        # 意図的にジョブを失敗（exit 1）させています。
+        # 後続ステップに if 条件を並べる必要がなくなり、かつ Actions 上で
+        # 「実行されたが処理されなかった」ことが明確に残ります。
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "スナップショットを発行できませんでした。"
+            echo ""
+            echo "このPRには未消費の changeset がありません。次のいずれかに該当します。"
+            echo ""
+            echo "- changeset の添付を忘れている → \`npx changeset\` を実行して追加してください"
+            echo "- Version PR（バージョン更新PR）である → このPRでは canary を使えません"
+            echo "  （本物のバージョンを先に公開してしまい、リリースが壊れるため禁止しています）"
+          } > guard.md
+          gh pr comment "${{ github.event.issue.number }}" --body-file guard.md
+          exit 1
+
+      - name: Node.js をセットアップ（認証付き .npmrc を生成）
+        uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
+          # registry-url と scope を指定すると、setup-node がランナー上に
+          #   @<scope>:registry=https://npm.pkg.github.com/
+          #   //npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
+          # という .npmrc を生成します。これがないと publish が
+          # npmjs.org を見に行ってしまいます。
           registry-url: https://npm.pkg.github.com
           scope: '@kentem-ka-hashimoto'
 
-      - run: npm ci
-      - run: npm run build
+      - name: 依存関係をインストール
+        run: npm ci
+
+      - name: ビルド
+        run: npm run build
 
       - name: スナップショットバージョンを付与
-        run: npx changeset version --snapshot canary
+        # --snapshot に渡すタグ名を `pr-<PR番号>` にしています。
+        # config.json の prereleaseTemplate が {tag}-{datetime} なので、
+        # 結果は 1.3.0-pr-123-20260901120000 のような形式になります。
+        #
+        # この書き換えはランナー上の package.json に対してのみ行われ、
+        # コミットも push もされません（使い捨て）。
+        #
+        # PR番号を ${{ }} で直接シェルに展開せず env 経由で渡しているのは、
+        # スクリプトインジェクションを避けるための書き方の統一です。
+        #
+        # 【補足】先頭の 1.3.0 は useCalculatedVersion: true による計算値で、
+        #   このPR以外の changeset も含めた結果です。
+        #   「1.3.0 が確定した」という意味ではない点をチームに周知してください。
+        #   major の changeset を含む場合は 2.0.0-pr-123-... になります。
+        env:
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: npx changeset version --snapshot "pr-${PR_NUMBER}"
 
-      - name: パッケージ情報を取得
+      - name: パッケージ名とバージョンを取得
         id: pkg
+        # このステップの位置が重要です。上の version の「後」に置くことで、
+        # 書き換わったスナップショットバージョンを読み取れます。
+        # 前に置くと公開前の元のバージョンを拾ってしまいます。
         run: |
           echo "name=$(node -p "require('./package.json').name")" >> "$GITHUB_OUTPUT"
           echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
-      - name: publish
+      - name: レジストリに publish
+        # --tag canary   … 必須です。省略すると dist-tag latest を上書きし、
+        #                   何も指定せず npm install した全プロダクトが
+        #                   このスナップショットを取得してしまいます。
+        # --no-git-tag   … 使い捨てバージョンに git タグを作りません。
+        #                   このジョブは contents: read しか持たないため、
+        #                   タグを push しようとすると権限エラーになります。
         run: npx changeset publish --tag canary --no-git-tag
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: コメント本文を生成
+      - name: PRコメントの本文を生成
+        # ファイルに書き出しているのは、コメント本文を
+        # `gh pr comment --body "..."` にインラインで渡すと、本文中の
+        # バックティック（```bash のコードブロック）がシェルのコマンド置換と
+        # 解釈されて表示が崩れるためです。--body-file で回避しています。
         env:
           PKG_NAME: ${{ steps.pkg.outputs.name }}
           PKG_VERSION: ${{ steps.pkg.outputs.version }}
@@ -60,9 +192,34 @@ jobs:
             echo '```'
             echo ""
             echo "このバージョンは \`canary\` タグで公開されています。\`latest\` は変更されていません。"
+            echo ""
+            echo "> \`@canary\` タグは他の方が \`/canary\` を実行すると別のPRのものに切り替わります。"
+            echo "> 検証時は上記の完全なバージョン文字列を指定してください。"
           } > comment.md
 
       - name: PRにインストールコマンドを投稿
+        # 消費側プロダクトの担当者は、このコメントをコピペするだけで
+        # スナップショットを試せます。
         run: gh pr comment "${{ github.event.issue.number }}" --body-file comment.md
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# =============================================================================
+# 【本番リポジトリへ持ち込むときのセキュリティ上の検討事項】
+#
+# このワークフローは「PRにコメントできる人」が
+# 「packages: write 権限を持ったジョブで、PRブランチのコードを実行できる」
+# という構造です（npm ci の postinstall や npm run build のビルドスクリプトは、
+# PRの作者が自由に書ける箇所です）。
+#
+# 社内リポジトリならリスクは限定的ですが、以下を検討しておくと安全です。
+#
+#   1. コメント投稿者の権限チェックを if 条件に追加する
+#      例: github.event.comment.author_association が
+#          'MEMBER' / 'OWNER' / 'COLLABORATOR' のいずれかであることを要求する
+#   2. Environment の承認機能を使い、publish ステップに手動承認を挟む
+#   3. fork からのPRを対象外にする
+#
+# また、スナップショットは publish するたびにレジストリに残り続けます。
+# 保持期間（例: 30日で削除）を運用ルールとして決めておく必要があります。
+# =============================================================================

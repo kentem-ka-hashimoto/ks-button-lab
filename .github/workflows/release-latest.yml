@@ -1,39 +1,179 @@
-name: Release
+# =============================================================================
+# .github/workflows/release-latest.yml
+# -----------------------------------------------------------------------------
+# 【役割】Version PR の作成、および latest タグでの正式公開。
+#
+#   4つのワークフローの中で、これだけが「正式なバージョン番号を消費する」
+#   ワークフローです。ファイル名が snapshot- ではなく release- なのは
+#   その区別を表しています。
+#
+# 【1つのステップが2つのモードを持ちます（最重要ポイント）】
+#   main への push をきっかけに、changesets/action が状況を見て
+#   どちらか一方を自動で選んで実行します。
+#
+#   ■ モードA: .changeset/*.md が残っている場合
+#       → バージョンを上げるPR（Version PR）を自動で作成・更新する
+#       → publish はしない
+#
+#   ■ モードB: .changeset/*.md が無い場合
+#       （= Version PR がマージされ、package.json のバージョンが既に上がった状態）
+#       → publish コマンドを実行して latest タグで公開する
+#
+#   つまり「機能PRをmainにマージした瞬間にpublishされる」のではありません。
+#   機能PRのマージはモードAを起こすだけで、Version PRを人がマージした
+#   タイミングで初めてモードB（publish）が走ります。
+#   週次publishの実体は「週に一度、人がVersion PRをマージする」ことです。
+#
+#     機能PR マージ ─┐
+#     機能PR マージ ─┼→ Version PR が育っていく（publishされない）
+#     機能PR マージ ─┘
+#                      ↓ 人が Version PR をマージ（週1回）
+#                    publish 実行 → latest タグ更新
+#
+#   ジョブ名を "Create version PR or publish" にしているのは、
+#   Actions の画面を見た人がこの2モードの存在に気づけるようにするためです。
+# =============================================================================
+
+name: Release (latest)
 
 on:
   push:
+    # main に何かが push された（= PRがマージされた）ときに実行されます。
+    # Version PR のマージも「mainへのpush」なので、同じワークフローが
+    # 再度起動し、そのときはモードBとして動作します。
     branches: [main]
 
-concurrency: ${{ github.workflow }}-${{ github.ref }}
+# 同じ ref に対する実行を1本に制限します。
+# 短時間に複数のPRが連続でマージされたとき、Version PR の更新処理や
+# publish が並行して走って競合するのを防ぐためです。
+#
+# グループ名は github.workflow を使わず固定文字列にしています
+# （ワークフロー名を後から変えてもグループが変わらないようにするため）。
+#
+# cancel-in-progress は指定していないため、実行中のジョブはキャンセルされず
+# 後続が待機（キュー）します。publish を途中で止められると危険なので、
+# ここでは待機させるのが正しい挙動です。
+#
+# 【補足】snapshot-next.yml とはワークフローが別なので両者は並行実行されます。
+#   Version PR マージ時は snapshot-next.yml 側のジョブがスキップされる設計なので、
+#   publish が二重に走ることはありません。
+concurrency: release-latest-${{ github.ref }}
 
 permissions:
+  # contents: write       … Version PR用のブランチ・コミット、リリースタグの作成
+  # pull-requests: write  … Version PR 自体の作成・更新
+  # packages: write       … GitHub Packages への publish
   contents: write
   pull-requests: write
   packages: write
 
 jobs:
-  release:
+  version-or-publish:
+    name: Create version PR or publish
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v7
         with:
+          # changesets は「前回のリリースからの変更」を扱うため、
+          # またCHANGELOG生成やタグ操作でコミット履歴を参照するため、
+          # 全履歴を取得しておきます。
           fetch-depth: 0
 
-      - uses: actions/setup-node@v6
+      - name: Node.js をセットアップ（認証付き .npmrc を生成）
+        uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
+          # registry-url と scope を指定すると、setup-node がランナー上に
+          #   @<scope>:registry=https://npm.pkg.github.com/
+          #   //npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
+          # という .npmrc を生成します。
+          # これがないと npm publish が npmjs.org を見に行ってしまいます。
           registry-url: https://npm.pkg.github.com
+          # ★実験用のプレースホルダーです。本番では実際のスコープに置き換えます。
+          #   ここが package.json の name のスコープと一致していないと、
+          #   認証設定が効かず publish が 401 / 404 になります。
           scope: '@<github-username>'
 
-      - run: npm ci
-      - run: npm run build
+      - name: 依存関係をインストール
+        run: npm ci
 
-      - uses: changesets/action@v1
+      - name: ビルド
+        # publish されるのはビルド成果物（dist）なので、
+        # publish の前に必ずビルドしておく必要があります。
+        run: npm run build
+
+      - name: Version PR の作成 または publish
+        # このステップ1つで、冒頭に書いたモードA / モードBの分岐が行われます。
+        uses: changesets/action@v1
         with:
+          # 【publish】
+          #   モードBのときに実行されるコマンドです。
+          #   package.json の scripts に定義されており、中身は
+          #   `changeset publish` 系のコマンドだと推測されます（要確認）。
+          #   このコマンドが0で終了すると、action は git タグの push まで
+          #   面倒を見ます。
+          #
+          #   なお publish 入力を指定しない場合、この action は
+          #   Version PR の作成しか行いません（= publishされない）。
           publish: npm run release
-          commit: "chore: version packages"
-          title: "chore: version packages"
+
+          # 【version】（このファイルでは未指定）
+          #   モードAで実行されるコマンドの指定で、既定値は `changeset version` です。
+          #   これが .changeset/*.md を消費して package.json のバージョンを上げ、
+          #   CHANGELOG.md を生成します。既定で問題ないため省略しています。
+
+          # 【title】Version PR のタイトル（既定値は "Version Packages"）
+          #   毎週このPRをマージするのが週次リリースの実体なので、
+          #   タイトル自体に「マージ = publish」を書き込んでおきます。
+          #   PR一覧画面で他のPRと明確に区別できることも狙いです。
+          title: "【リリース】バージョン更新（このPRをマージすると publish されます）"
+
+          # 【commit】Version PR に積まれるコミットのメッセージ（既定値は同上）
+          #   commitlint や semantic-pull-request のようなチェックを
+          #   導入する場合に備え、`chore:` プレフィックスは残しています。
+          commit: "chore: バージョン更新"
         env:
+          # GITHUB_TOKEN     … Version PR の作成・更新、タグの push に使われます
+          # NODE_AUTH_TOKEN  … 上で生成した .npmrc から参照され、publish の認証に使われます
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# =============================================================================
+# 【本番リポジトリへ持ち込むときの前提条件】
+#
+# 1. Organization / リポジトリ設定
+#    Settings > Actions > General の
+#    「Allow GitHub Actions to create and approve pull requests」が
+#    有効になっていないと、モードAのVersion PR作成が権限エラーで失敗します。
+#
+# 2. main のブランチ保護との相性
+#    Version PR は github-actions[bot] が作成します。
+#    「承認1件以上必須」「Code Ownerの承認必須」などのルールを掛ける場合、
+#    botが作ったPRが承認フローを通過できるかを事前に確認してください。
+#    （bot自身は承認できないため、人間のレビュアーが必要になります）
+#
+# 3. GITHUB_TOKEN で作成したPRはCIが起動しない
+#    GitHub の仕様上、GITHUB_TOKEN による push / PR作成では
+#    他のワークフロー（pr-checks.yml など）がトリガーされません。
+#    Version PR に対してCIを走らせたい場合は、PATやGitHub Appの
+#    トークンを使う必要があります。
+#    ブランチ保護で「必須ステータスチェック」を設定すると、
+#    CIが起動しないVersion PRがマージできなくなる可能性があるため、
+#    ブランチ保護の検証時にセットで確認してください。
+#
+# 4. Changesets本体とactionのバージョン組み合わせ（★導入時に確認）
+#    changesets/action@v1 は Changesets v2系に対応するバージョンです。
+#    Changesets v3対応の action@v2 は、現時点ではまだプレリリース段階です。
+#    そのため今の時点では
+#      - @changesets/cli を ^2.31.1 に固定
+#      - changesets/action@v1 を使用
+#    の組み合わせが安全です。何も指定せず npm install すると
+#    v3系が入り、action v1 との組み合わせになってしまうためご注意ください。
+#
+# 5. Version PR のタイトルを後から変えた場合
+#    既に開いているVersion PRのタイトルが自動で追随するかは
+#    確証がないため（推測）、この変更をmainに入れるタイミングでは
+#    一度Version PRを閉じてから反映すると確実です。
+# =============================================================================
